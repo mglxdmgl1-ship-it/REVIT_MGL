@@ -144,15 +144,28 @@ create table if not exists public.kz_licenses (
 create index if not exists kz_licenses_user_idx on public.kz_licenses (user_id);
 
 -- Equipo vinculado. machine_hash es la huella de la placa base (SMBIOS) calculada en el add-in.
+-- El inventario (nombre del PC, usuario, marca, modelo, tipo, CPU, RAM, IP) lo usa el admin para
+-- soporte y para detectar licencias compartidas; se informa al cliente en la política de privacidad.
 create table if not exists public.kz_devices (
     id             uuid primary key default gen_random_uuid(),
     license_id     uuid not null references public.kz_licenses (id) on delete cascade,
     machine_hash   text not null,
     machine_id     text not null default '',
     label          text not null default '',
+    computer_name  text not null default '',
+    windows_user   text not null default '',
+    manufacturer   text not null default '',
+    model          text not null default '',
+    chassis        text not null default '',
+    cpu            text not null default '',
+    ram_gb         numeric(6, 1),
+    board          text not null default '',
     os             text not null default '',
     revit_version  text not null default '',
     addin_version  text not null default '',
+    first_ip       text not null default '',
+    last_ip        text not null default '',
+    hardware       jsonb not null default '{}'::jsonb,
     active         boolean not null default true,
     first_seen     timestamptz not null default now(),
     last_seen      timestamptz not null default now(),
