@@ -1,0 +1,31 @@
+# Despliegue de la web a Netlify (sitio kaizen-revit) en cada push.
+#
+# Alternativa a vincular el repositorio desde el panel de Netlify. Necesita el secreto del
+# repositorio NETLIFY_AUTH_TOKEN (Netlify → User settings → Applications → Personal access tokens).
+# Sin el secreto, el job se salta y no falla.
+name: netlify
+
+on:
+  push:
+    branches: ["**"]
+    paths: ["web/**", "netlify.toml", ".github/workflows/netlify.yml"]
+  workflow_dispatch:
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    env:
+      NETLIFY_AUTH_TOKEN: ${{ secrets.NETLIFY_AUTH_TOKEN }}
+      NETLIFY_SITE_ID: 58ba4d86-28a8-44a4-800d-95fb56b93f16
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Build
+        working-directory: web
+        run: npm ci && npm run build
+      - name: Deploy
+        if: env.NETLIFY_AUTH_TOKEN != ''
+        working-directory: web
+        run: npx -y netlify-cli@17 deploy --prod --dir dist --site "$NETLIFY_SITE_ID" --auth "$NETLIFY_AUTH_TOKEN" --message "${{ github.sha }}"
