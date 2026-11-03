@@ -3,7 +3,7 @@ import {
   addPlan, Caller, db, DAY_MS, fail, generateLicenseKey, HttpError, ok, PlanRow, setting, str,
 } from "./shared.ts";
 
-const SITE_URL = (Deno.env.get("SITE_URL") ?? "").replace(/\/+$/, "");
+const SITE_URL = (Deno.env.get("SITE_URL") ?? "https://kaizen-revit.netlify.app").replace(/\/+$/, "");
 const MP_TOKEN = Deno.env.get("MP_ACCESS_TOKEN") ?? "";
 
 async function getPlan(id: string): Promise<PlanRow> {
