@@ -1,9 +1,8 @@
 -- =============================================================================================
 -- KAIZEN · plataforma de licencias
 --
--- Todo lleva el prefijo kz_ porque el proyecto Supabase ya aloja otra aplicación (tabla
--- `perfiles`, funciones `crear_perfil`, `es_admin`, `autoconfirmar`). Nada de aquí lee ni
--- modifica esos objetos: KAIZEN tiene su propio perfil y su propio rol de administrador.
+-- Proyecto Supabase dedicado (kaizen-licencias). El prefijo kz_ se conserva para que el esquema
+-- pueda convivir con otras aplicaciones si algún día se comparte el proyecto.
 --
 -- Escrituras sensibles (crear licencias, aprobar pagos, vincular equipos, firmar versiones) NO
 -- se hacen desde el navegador: pasan por la Edge Function `kaizen` con la service role. El
@@ -51,7 +50,7 @@ security definer
 set search_path = ''
 as $$
 begin
-    -- Nunca debe impedir el alta de un usuario (el proyecto comparte auth con otra app).
+    -- Un fallo aquí nunca debe impedir el alta del usuario.
     begin
         insert into public.kz_profiles (id, email, full_name, phone, role)
         values (
@@ -75,6 +74,32 @@ drop trigger if exists kz_on_auth_user_created on auth.users;
 create trigger kz_on_auth_user_created
     after insert on auth.users
     for each row execute function public.kz_handle_new_user();
+
+-- Confirmación automática del correo.
+--
+-- El SMTP incluido en Supabase solo envía a los miembros del equipo del proyecto, así que sin un
+-- SMTP propio los clientes nunca recibirían el correo de confirmación y no podrían entrar. La
+-- licencia queda atada a la placa base, de modo que un correo falso no regala nada. Cuando se
+-- configure un SMTP (Resend, Brevo…) en Auth → SMTP, basta con borrar este trigger.
+create or replace function public.kz_autoconfirm()
+returns trigger
+language plpgsql
+security definer
+set search_path = ''
+as $$
+begin
+    if new.email_confirmed_at is null then
+        new.email_confirmed_at := now();
+    end if;
+    return new;
+end;
+$$;
+revoke all on function public.kz_autoconfirm() from public, anon, authenticated;
+
+drop trigger if exists kz_autoconfirm_user on auth.users;
+create trigger kz_autoconfirm_user
+    before insert on auth.users
+    for each row execute function public.kz_autoconfirm();
 
 -- ---------------------------------------------------------------------------------------------
 -- Planes (editables por el administrador)
@@ -153,7 +178,9 @@ create table if not exists public.kz_orders (
     plan_id           text not null references public.kz_plans (id),
     plan_name         text not null default '',
     amount_pen        numeric(10, 2) not null,
-    method            text not null check (method in ('mercadopago', 'yape', 'plin', 'transferencia', 'manual')),
+    -- id de kz_payment_methods, o 'mercadopago' / 'manual' (licencia creada por el admin).
+    method            text not null,
+    method_name       text not null default '',
     status            text not null default 'pending' check (status in ('pending', 'review', 'paid', 'rejected', 'cancelled')),
     provider_ref      text,
     provider_status   text,
@@ -215,6 +242,25 @@ create table if not exists public.kz_settings (
     updated_at  timestamptz not null default now()
 );
 
+-- ---------------------------------------------------------------------------------------------
+-- Métodos de pago manuales (Yape, Plin, transferencia, …). El admin agrega, edita y ordena.
+-- ---------------------------------------------------------------------------------------------
+create table if not exists public.kz_payment_methods (
+    id            text primary key,
+    name          text not null,
+    kind          text not null default 'wallet' check (kind in ('wallet', 'bank', 'cash', 'other')),
+    holder        text not null default '',
+    account       text not null default '',
+    account_alt   text not null default '',
+    instructions  text not null default '',
+    qr_url        text not null default '',
+    requires_voucher boolean not null default true,
+    active        boolean not null default true,
+    sort          integer not null default 0,
+    created_at    timestamptz not null default now(),
+    updated_at    timestamptz not null default now()
+);
+
 -- updated_at automático
 create or replace function public.kz_touch()
 returns trigger language plpgsql set search_path = '' as $$
@@ -228,6 +274,8 @@ drop trigger if exists kz_plans_touch on public.kz_plans;
 create trigger kz_plans_touch before update on public.kz_plans for each row execute function public.kz_touch();
 drop trigger if exists kz_licenses_touch on public.kz_licenses;
 create trigger kz_licenses_touch before update on public.kz_licenses for each row execute function public.kz_touch();
+drop trigger if exists kz_payment_methods_touch on public.kz_payment_methods;
+create trigger kz_payment_methods_touch before update on public.kz_payment_methods for each row execute function public.kz_touch();
 drop trigger if exists kz_settings_touch on public.kz_settings;
 create trigger kz_settings_touch before update on public.kz_settings for each row execute function public.kz_touch();
 
@@ -244,6 +292,7 @@ alter table public.kz_orders          enable row level security;
 alter table public.kz_events          enable row level security;
 alter table public.kz_releases        enable row level security;
 alter table public.kz_settings        enable row level security;
+alter table public.kz_payment_methods enable row level security;
 
 -- Perfiles: cada uno ve el suyo; el admin ve todos. El cliente solo puede cambiar sus datos de
 -- contacto: el rol y el bloqueo quedan fuera por permisos de columna (no hay escalada a admin).
@@ -300,6 +349,16 @@ grant insert (version, channel, revit_versions, notes, download_url, sha256, siz
     on public.kz_releases to authenticated;
 grant update (version, channel, revit_versions, notes, download_url, sha256, size_bytes, mandatory)
     on public.kz_releases to authenticated;
+
+-- Métodos de pago: los activos son públicos; el admin los gestiona.
+create policy kz_payment_methods_select on public.kz_payment_methods
+    for select to anon, authenticated using (active or (select public.kz_is_admin()));
+create policy kz_payment_methods_admin_insert on public.kz_payment_methods
+    for insert to authenticated with check ((select public.kz_is_admin()));
+create policy kz_payment_methods_admin_update on public.kz_payment_methods
+    for update to authenticated using ((select public.kz_is_admin())) with check ((select public.kz_is_admin()));
+create policy kz_payment_methods_admin_delete on public.kz_payment_methods
+    for delete to authenticated using ((select public.kz_is_admin()));
 
 -- Ajustes
 create policy kz_settings_select on public.kz_settings
@@ -373,15 +432,22 @@ insert into public.kz_plans (id, name, tagline, months, days, price_pen, list_pr
 on conflict (id) do nothing;
 
 insert into public.kz_settings (key, value, public) values
-    ('payment', jsonb_build_object(
-        'yape_number', '', 'yape_holder', '',
-        'plin_number', '', 'plin_holder', '',
-        'bank_name', '', 'bank_account', '', 'bank_cci', '', 'bank_holder', '',
-        'mercadopago_enabled', false
+    ('contact', jsonb_build_object(
+        'whatsapp', '51951230463',
+        'whatsapp_display', '951 230 463',
+        'email', '',
+        'hours', 'Lun–Sáb, 9:00–19:00',
+        'whatsapp_message', 'Hola, quiero información sobre KAIZEN para Revit.'
     ), true),
-    ('contact', jsonb_build_object('whatsapp', '', 'email', '', 'hours', 'Lun–Sáb, 9:00–19:00'), true),
+    ('mercadopago', jsonb_build_object('enabled', false), true),
     ('licensing', jsonb_build_object('trial_days', 3, 'check_interval_days', 5), true)
 on conflict (key) do nothing;
+
+insert into public.kz_payment_methods (id, name, kind, holder, account, instructions, requires_voucher, sort) values
+    ('yape', 'Yape', 'wallet', '', '951230463',
+     'Yapea el monto exacto al número indicado, escribe en el mensaje tu código de pedido y sube la captura del pago. Te activamos en minutos (horario de atención).',
+     true, 10)
+on conflict (id) do nothing;
 
 -- Administrador inicial: el dueño de la cuenta Supabase/Netlify.
 insert into public.kz_admin_allowlist (email) values ('mgl.xdmgl1@gmail.com') on conflict do nothing;
